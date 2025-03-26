@@ -155,7 +155,7 @@ class NumberCombinationApp:
 
     def stop_calculation(self):
         self.calculation_running = False
-        self.progress_queue.put((0, "计算已停止"))
+        self.progress_queue.put((0, "正在停止计算..."))
         self.calc_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
 
@@ -187,6 +187,152 @@ class NumberCombinationApp:
 
     def calculate_combinations(self, target: float) -> List[List[float]]:
         """计算组合的核心逻辑"""
+        if not self.use_parallel.get():
+            return self._calculate_combinations_sequential(target)
+            
+        from multiprocessing import Pool, cpu_count, Manager
+        import math
+        
+        target_int = int(target * 100)
+        num_workers = cpu_count() * 2  # 使用双倍CPU核心数
+        chunk_size = max(50, len(self.numbers) // (num_workers * 2))  # 更小的块大小
+        
+        # 将数字列表分块
+        chunks = [self.numbers[i:i+chunk_size] 
+                 for i in range(0, len(self.numbers), chunk_size)]
+        
+        # 使用Manager共享状态
+        with Manager() as manager:
+            # 创建共享字典和事件
+            shared_dict = manager.dict()
+            shared_dict[0] = [[]]
+            stop_event = manager.Event()
+            progress_value = manager.Value('d', 0.0)
+            status_text = manager.Value('c', "并行计算中...".encode())
+            
+            # 使用进程池并行计算
+            with Pool(processes=num_workers) as pool:
+                try:
+                    results = []
+                    total_processed = 0
+                    processed_chunks = 0
+                    
+                    # 提交所有任务
+                    for chunk in chunks:
+                        if not self.calculation_running:
+                            break
+                        result = pool.apply_async(
+                            worker,
+                            (chunk, target_int, self.find_all.get(), shared_dict, stop_event)
+                        )
+                        results.append(result)
+                    
+                    # 监控进度
+                    total_numbers = len(self.numbers)
+                    processed_numbers = 0
+                    last_update_time = time.time()
+                    
+                    while self.calculation_running and processed_chunks < len(results):
+                        time.sleep(0.1)  # 减少CPU占用
+                        
+                        # 检查已完成的任务
+                        ready = []
+                        for r in results:
+                            if r.ready():
+                                ready.append(r)
+                                try:
+                                    chunk_result = r.get(timeout=0.1)
+                                    if chunk_result:
+                                        processed_numbers += len(chunk_result)
+                                except:
+                                    pass
+                        
+                        processed_chunks = len(ready)
+                        
+                        # 更平滑的进度计算
+                        # 块处理基础进度(20%) + 数字处理进度(80%)
+                        base_progress = processed_chunks / len(chunks) * 20
+                        number_progress = processed_numbers / total_numbers * 80
+                        progress = min(99, base_progress + number_progress)
+                        
+                        # 更频繁的进度更新(每秒最多20次)
+                        if time.time() - last_update_time > 0.05:
+                            # 添加进度平滑 - 每次更新不超过5%
+                            if progress - progress_value.value > 5:
+                                progress_value.value += 5
+                            else:
+                                progress_value.value = progress
+                                
+                            status_text.value = f"并行计算中... {progress_value.value:.1f}%".encode()
+                            self.progress_queue.put((progress_value.value, status_text.value.decode()))
+                            last_update_time = time.time()
+                        
+                        # 检查停止信号
+                        if not self.calculation_running:
+                            stop_event.set()
+                            pool.terminate()  # 立即终止所有进程
+                            break
+                    
+                    # 合并结果
+                    final_result = []
+                    for result in results:
+                        if not self.calculation_running:
+                            break
+                            
+                        try:
+                            chunk_dp = result.get(timeout=0.1)
+                            if chunk_dp and target_int in chunk_dp:
+                                final_result.extend(chunk_dp[target_int])
+                                if not self.find_all.get():
+                                    return final_result[:1]
+                        except:
+                            continue
+                    
+                    # 最终进度更新
+                    if self.calculation_running:
+                        progress_value.value = 100
+                        status_text.value = "正在合并结果...".encode()
+                        self.progress_queue.put((progress_value.value, status_text.value.decode()))
+                
+                finally:
+                    # 确保资源释放
+                    stop_event.set()
+                    pool.terminate()
+                    pool.join()
+            return final_result
+
+    def _calculate_chunk_combinations(self, numbers_chunk, target_int, find_all):
+        """计算单个块的组合"""
+        dp = {0: [[]]}
+        min_num = min(numbers_chunk) * 100 if numbers_chunk else 0
+        
+        for i, num in enumerate(numbers_chunk):
+            num_int = int(round(num * 100))
+            new_sums = {}
+            
+            for curr_sum, combinations in list(dp.items()):
+                if curr_sum + num_int <= target_int:
+                    # 限制组合数量，最多存储100个组合
+                    new_combinations = [combo + [num] for combo in combinations][:100]
+                    if curr_sum + num_int in new_sums:
+                        new_sums[curr_sum + num_int].extend(new_combinations)
+                    else:
+                        new_sums[curr_sum + num_int] = new_combinations
+                    
+                    if not find_all and curr_sum + num_int == target_int:
+                        return {target_int: new_combinations[:1]}
+            
+            dp.update(new_sums)
+            
+            # 更频繁的内存清理
+            if i % 5 == 0:  # 每5个数字清理一次
+                dp = {k: v[:100] for k, v in dp.items()  # 限制每个sum的组合数
+                     if k + min_num <= target_int}
+        
+        return dp
+
+    def _calculate_combinations_sequential(self, target: float) -> List[List[float]]:
+        """单线程计算组合"""
         target_int = int(target * 100)
         dp = {0: [[]]}
         total_iterations = len(self.numbers)
@@ -234,6 +380,42 @@ class NumberCombinationApp:
                 self.result_text.insert(tk.END, 
                     f"组合 {i}: {[round(x, 2) for x in combo]} (总和: {sum(combo):.2f})\n")
             self.result_text.insert(tk.END, f"\n{message}")
+
+def worker(chunk, target_int, find_all, shared_dict, stop_event):
+    """工作进程函数"""
+    if stop_event.is_set():
+        return {}
+        
+    dp = {0: [[]]}
+    min_num = min(chunk) * 100 if chunk else 0
+    
+    for i, num in enumerate(chunk):
+        if stop_event.is_set():
+            return {}
+            
+        num_int = int(round(num * 100))
+        new_sums = {}
+        
+        for curr_sum, combinations in list(dp.items()):
+            if curr_sum + num_int <= target_int:
+                # 限制组合数量，最多存储100个组合
+                new_combinations = [combo + [num] for combo in combinations][:100]
+                if curr_sum + num_int in new_sums:
+                    new_sums[curr_sum + num_int].extend(new_combinations)
+                else:
+                    new_sums[curr_sum + num_int] = new_combinations
+                
+                if not find_all and curr_sum + num_int == target_int:
+                    return {target_int: new_combinations[:1]}
+        
+        dp.update(new_sums)
+        
+        # 更频繁的内存清理
+        if i % 5 == 0:  # 每5个数字清理一次
+            dp = {k: v[:100] for k, v in dp.items()  # 限制每个sum的组合数
+                 if k + min_num <= target_int}
+    
+    return dp
 
 if __name__ == "__main__":
     root = tk.Tk()
